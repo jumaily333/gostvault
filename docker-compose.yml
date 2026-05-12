@@ -1,0 +1,138 @@
+version: "3.9"
+
+# =============================================================================
+# GhostVault Intelligence System — Docker Compose
+# Services: API, PostgreSQL, Redis
+# =============================================================================
+
+x-api-common: &api-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+  environment:
+    - APP_ENV=production
+    - DATABASE_URL=postgresql+asyncpg://ghostvault:${POSTGRES_PASSWORD:-ghostvault_secret}@postgres:5432/ghostvault
+    - REDIS_URL=redis://redis:6379/0
+    - SECRET_KEY=${SECRET_KEY:-change-me-32-chars-minimum-here!!}
+    - ETHEREUM_RPC_URL=${ETHEREUM_RPC_URL:-https://mainnet.infura.io/v3/YOUR_KEY}
+    - ETHEREUM_FALLBACK_RPC_URL=${ETHEREUM_FALLBACK_RPC_URL:-}
+    - ELECTRUM_HOST=${ELECTRUM_HOST:-electrum.blockstream.info}
+    - ELECTRUM_PORT=${ELECTRUM_PORT:-50002}
+    - ELECTRUM_USE_SSL=${ELECTRUM_USE_SSL:-true}
+    - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+    - SOLANA_FALLBACK_RPC_URL=${SOLANA_FALLBACK_RPC_URL:-}
+    - BITCOIN_RPC_URL=${BITCOIN_RPC_URL:-}
+    - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    - LOG_FORMAT=${LOG_FORMAT:-json}
+    - DORMANCY_THRESHOLD_DAYS=${DORMANCY_THRESHOLD_DAYS:-365}
+    - SCORE_WEIGHT_INACTIVITY=0.40
+    - SCORE_WEIGHT_TX_FREQUENCY=0.25
+    - SCORE_WEIGHT_WALLET_AGE=0.20
+    - SCORE_WEIGHT_MOVEMENT_PATTERN=0.15
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  networks:
+    - ghostvault-net
+
+services:
+
+  # ── API ──────────────────────────────────────────────────────────────────────
+  api:
+    <<: *api-common
+    container_name: ghostvault-api
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Database migration job ───────────────────────────────────────────────────
+  migrate:
+    <<: *api-common
+    container_name: ghostvault-migrate
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: ghostvault-postgres
+    environment:
+      POSTGRES_DB: ghostvault
+      POSTGRES_USER: ghostvault
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ghostvault_secret}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ghostvault -d ghostvault"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - ghostvault-net
+    command: >
+      postgres
+        -c max_connections=200
+        -c shared_buffers=256MB
+        -c effective_cache_size=768MB
+        -c maintenance_work_mem=64MB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+        -c log_min_duration_statement=1000
+
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ghostvault-redis
+    command: >
+      redis-server
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --save 900 1
+        --save 300 10
+        --appendonly yes
+        --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - ghostvault-net
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  ghostvault-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
